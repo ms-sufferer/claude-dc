@@ -1,0 +1,7 @@
+{
+  "name": "discord",
+  "version": "1.0.0",
+  "description": "Odczyt kanałów firmowego serwera Discord w Claude Code (tylko do odczytu).",
+  "author": { "name": "ms-sufferer" },
+  "license": "MIT"
+}

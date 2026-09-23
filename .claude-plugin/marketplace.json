@@ -1,0 +1,14 @@
+{
+  "name": "ms-sufferer",
+  "owner": { "name": "ms-sufferer" },
+  "metadata": {
+    "description": "Firmowe pluginy Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "discord",
+      "source": "./plugins/discord",
+      "description": "Odczyt kanałów firmowego serwera Discord w Claude Code (tylko do odczytu)."
+    }
+  ]
+}

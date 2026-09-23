@@ -42,6 +42,12 @@ Jeśli na komputerze jest już zalogowane inne konto GitHub bez dostępu, dopisz
 
 > Przeczytaj ostatnie 100 wiadomości z kanału #ogólny i podsumuj ustalenia
 
+## Co potrafi
+
+- `read_messages`: do 1000 wiadomości na wywołanie, zakres `after`/`before` (ID wiadomości albo data, np. `2026-01-01`),
+  razem z załącznikami, osadzeniami i odpowiedziami. Gdy wynik jest za duży, kończy się podpowiedzią, od którego miejsca czytać dalej.
+- `get_attachment`: pokazuje zdjęcia z wiadomości (do 5 na raz, każde do 5 MB) i treść plików tekstowych.
+
 ## Aktualizacja
 
 ```

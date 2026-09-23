@@ -1,14 +1,15 @@
 import os
 import sys
+import base64
 import asyncio
 import logging
-from datetime import datetime
-from typing import Any, List
+from datetime import datetime, timezone
+from typing import Any, List, Union
 from functools import wraps
 import discord
 from discord.ext import commands
 from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent
 from mcp.server.stdio import stdio_server
 
 def _configure_windows_stdout_encoding():
@@ -59,7 +60,58 @@ def require_discord_client(func):
 READ_ONLY_TOOLS = {
     "list_servers", "get_server_info", "get_channels",
     "list_members", "get_user_info", "read_messages",
+    "get_attachment",
 }
+
+# Jedno wywolanie read_messages pobiera najwyzej tyle wiadomosci (discord.py sam stronicuje po 100).
+MAX_MESSAGES = 1000
+# Claude Code ucina duze odpowiedzi narzedzi, wiec wynik tniemy wczesniej i podajemy kursor do dalszej czesci.
+MAX_OUTPUT_CHARS = 60000
+# Limit rozmiaru pojedynczego obrazu przyjmowanego przez Claude.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGES_PER_CALL = 5
+MAX_TEXT_ATTACHMENT_CHARS = 50000
+
+def _parse_history_point(value):
+    """ID wiadomosci albo data ISO (np. 2026-01-01) -> punkt dla channel.history()."""
+    if value is None or str(value).strip() == "":
+        return None
+    s = str(value).strip()
+    if s.isdigit():
+        return discord.Object(id=int(s))
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def _format_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{max(1, size // 1024)} KB"
+
+def _format_message(message: discord.Message) -> str:
+    lines = [f"[{message.id}] {message.author} ({message.created_at.isoformat()}): {message.content}"]
+    if message.reference and message.reference.message_id:
+        lines.append(f"  odpowiedz na: {message.reference.message_id}")
+    for i, a in enumerate(message.attachments, start=1):
+        kind = a.content_type or "nieznany typ"
+        dims = f", {a.width}x{a.height}" if a.width and a.height else ""
+        lines.append(f"  zalacznik {i}: {a.filename} ({kind}, {_format_size(a.size)}{dims})")
+    for e in message.embeds:
+        parts = [p for p in (e.title, e.url) if p]
+        image = (e.image and e.image.url) or (e.thumbnail and e.thumbnail.url)
+        if image:
+            parts.append(f"obraz: {image}")
+        if parts:
+            lines.append("  osadzenie: " + " | ".join(parts))
+    for s in message.stickers:
+        lines.append(f"  naklejka: {s.name}")
+    if message.reactions:
+        reactions = ", ".join(
+            f"{getattr(r.emoji, 'name', None) or r.emoji}({r.count})" for r in message.reactions
+        )
+        lines.append(f"  reakcje: {reactions}")
+    return "\n".join(lines)
 
 @app.list_tools()
 async def list_tools() -> List[Tool]:
@@ -301,7 +353,12 @@ def _all_tools() -> List[Tool]:
         ),
         Tool(
             name="read_messages",
-            description="Read recent messages from a channel",
+            description=(
+                "Read messages from a channel, including attachments (images, files), embeds and replies. "
+                "Each message starts with its ID in brackets. Use 'after'/'before' (message ID or ISO date) "
+                "for a time range; if the output is cut, it ends with the exact 'before'/'after' value "
+                "for the next call. View an attached image with get_attachment."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -311,12 +368,50 @@ def _all_tools() -> List[Tool]:
                     },
                     "limit": {
                         "type": "number",
-                        "description": "Number of messages to fetch (max 100)",
+                        "description": f"Number of messages to fetch (default 50, max {MAX_MESSAGES})",
                         "minimum": 1,
-                        "maximum": 100
+                        "maximum": MAX_MESSAGES
+                    },
+                    "before": {
+                        "type": "string",
+                        "description": "Only messages older than this message ID or ISO date (e.g. 2026-06-30)"
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Only messages newer than this message ID or ISO date (e.g. 2026-01-01)"
+                    },
+                    "oldest_first": {
+                        "type": "boolean",
+                        "description": "Chronological order. Default: newest first, or oldest first when 'after' is set"
                     }
                 },
                 "required": ["channel_id"]
+            }
+        ),
+        Tool(
+            name="get_attachment",
+            description=(
+                "Fetch attachments of one message so they can be viewed: images are returned as images, "
+                "text files (txt, csv, json, ...) as text, other files as a description only."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Discord channel ID"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "ID of the message with attachments (from read_messages)"
+                    },
+                    "attachment": {
+                        "type": "number",
+                        "description": f"Attachment number from read_messages (1, 2, ...). Omit to get all (max {MAX_IMAGES_PER_CALL} images)",
+                        "minimum": 1
+                    }
+                },
+                "required": ["channel_id", "message_id"]
             }
         ),
         Tool(
@@ -374,7 +469,7 @@ def _all_tools() -> List[Tool]:
 
 @app.call_tool()
 @require_discord_client
-async def call_tool(name: str, arguments: Any) -> List[TextContent]:
+async def call_tool(name: str, arguments: Any) -> List[Union[TextContent, ImageContent]]:
     """Handle Discord tool calls."""
     if name not in READ_ONLY_TOOLS:
         raise ValueError(f"Tool disabled (read-only server): {name}")
@@ -389,39 +484,80 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     elif name == "read_messages":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        limit = min(int(arguments.get("limit", 10)), 100)
-        fetch_users = arguments.get("fetch_reaction_users", False)  # Only fetch users if explicitly requested
-        messages = []
-        async for message in channel.history(limit=limit):
-            reaction_data = []
-            for reaction in message.reactions:
-                emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
-                reaction_info = {
-                    "emoji": emoji_str,
-                    "count": reaction.count
-                }
-                logger.error(f"Emoji: {emoji_str}")
-                reaction_data.append(reaction_info)
-            messages.append({
-                "id": str(message.id),
-                "author": str(message.author),
-                "content": message.content,
-                "timestamp": message.created_at.isoformat(),
-                "reactions": reaction_data  # Add reactions to message dict
-            })
-        # Helper function to format reactions
-        def format_reaction(r):
-            return f"{r['emoji']}({r['count']})"
-            
-        return [TextContent(
-            type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" + 
-                 "\n".join([
-                     f"{m['author']} ({m['timestamp']}): {m['content']}\n" +
-                     f"Reactions: {', '.join([format_reaction(r) for r in m['reactions']]) if m['reactions'] else 'No reactions'}"
-                     for m in messages
-                 ])
-        )]
+        limit = max(1, min(int(arguments.get("limit", 50)), MAX_MESSAGES))
+        try:
+            before = _parse_history_point(arguments.get("before"))
+            after = _parse_history_point(arguments.get("after"))
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Bledny format 'before'/'after' (podaj ID wiadomosci albo date ISO): {e}")]
+        history_args = {"limit": limit, "before": before, "after": after}
+        if arguments.get("oldest_first") is not None:
+            history_args["oldest_first"] = bool(arguments["oldest_first"])
+
+        blocks = []
+        used = 0
+        last = None
+        cut = False
+        async for message in channel.history(**history_args):
+            block = _format_message(message)
+            if blocks and used + len(block) > MAX_OUTPUT_CHARS:
+                cut = True
+                break
+            blocks.append(block)
+            used += len(block) + 1
+            last = message
+
+        if not blocks:
+            return [TextContent(type="text", text="Brak wiadomosci w podanym zakresie.")]
+
+        header = f"Retrieved {len(blocks)} messages ({blocks[0].split(' ', 1)[0]} .. {blocks[-1].split(' ', 1)[0]}):"
+        text = header + "\n\n" + "\n".join(blocks)
+        if cut or len(blocks) == limit:
+            # Kolejnosc chronologiczna -> dalej idziemy w przod (after), odwrotna -> w tyl (before).
+            chronological = history_args.get("oldest_first", after is not None)
+            cursor = "after" if chronological else "before"
+            reason = "Wynik uciety ze wzgledu na rozmiar" if cut else "Osiagnieto limit"
+            text += f"\n\n{reason}. Dalsze wiadomosci: wywolaj ponownie z {cursor}=\"{last.id}\"."
+        return [TextContent(type="text", text=text)]
+
+    elif name == "get_attachment":
+        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+        # Swieze pobranie wiadomosci daje aktualne (podpisane, wygasajace) adresy plikow.
+        message = await channel.fetch_message(int(arguments["message_id"]))
+        attachments = list(enumerate(message.attachments, start=1))
+        if not attachments:
+            return [TextContent(type="text", text="Ta wiadomosc nie ma zalacznikow.")]
+        if arguments.get("attachment") is not None:
+            index = int(arguments["attachment"])
+            attachments = [(i, a) for i, a in attachments if i == index]
+            if not attachments:
+                return [TextContent(type="text", text=f"Brak zalacznika nr {index} (wiadomosc ma {len(message.attachments)}).")]
+
+        result: List[Union[TextContent, ImageContent]] = []
+        images = 0
+        for i, a in attachments:
+            kind = (a.content_type or "").split(";")[0].strip().lower()
+            label = f"Zalacznik {i}: {a.filename} ({kind or 'nieznany typ'}, {_format_size(a.size)})"
+            if kind.startswith("image/"):
+                if a.size > MAX_IMAGE_BYTES:
+                    result.append(TextContent(type="text", text=f"{label} - za duzy do podgladu (limit {_format_size(MAX_IMAGE_BYTES)})."))
+                    continue
+                if images >= MAX_IMAGES_PER_CALL:
+                    result.append(TextContent(type="text", text=f"{label} - pominiety, limit {MAX_IMAGES_PER_CALL} obrazow na wywolanie; pobierz go z attachment={i}."))
+                    continue
+                data = await a.read()
+                result.append(TextContent(type="text", text=label))
+                result.append(ImageContent(type="image", data=base64.b64encode(data).decode("ascii"), mimeType=kind))
+                images += 1
+            elif kind.startswith("text/") or kind in ("application/json", "application/xml", "application/csv"):
+                data = await a.read()
+                content = data.decode("utf-8", errors="replace")
+                if len(content) > MAX_TEXT_ATTACHMENT_CHARS:
+                    content = content[:MAX_TEXT_ATTACHMENT_CHARS] + "\n[... uciete]"
+                result.append(TextContent(type="text", text=f"{label}:\n{content}"))
+            else:
+                result.append(TextContent(type="text", text=f"{label} - tego typu pliku nie da sie podejrzec."))
+        return result
 
     elif name == "get_user_info":
         user = await discord_client.fetch_user(int(arguments["user_id"]))
